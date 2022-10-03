@@ -2,7 +2,111 @@ import discord
 import os
 from dotenv import load_dotenv
 from datetime import datetime,timedelta
-import state
+import pickle
+
+class Acronym(object):
+    def __init__(self, acronym: str, expansion: str):
+        self.__acronym = acronym
+        self.__search = acronym.upper()
+        self.__expansion = expansion
+        self.__channel_timeouts = {}
+        self.__global_timeout = None
+
+    def acronym(self) -> str:
+        return self.__acronym
+
+    def expansion(self) -> str:
+        return self.__expansion
+
+    def should_expand(self, channel_id: int) -> bool:
+        if channel_id in self.__channel_timeouts:
+            if self.__channel_timeouts[channel_id] < datetime.now():
+                del self.__channel_timeouts[channel_id]
+        if self.__global_timeout is not None:
+            if self.__global_timeout < datetime.now():
+                self.__global_timeout = None
+        return channel_id not in self.__channel_timeouts and self.__global_timeout == None
+
+    def is_within(self, message: str) -> bool:
+        return self.__search in message.upper()
+
+    async def expand(self, message: discord.Message, global_cooldown: timedelta, channel_cooldown: timedelta):
+        if global_cooldown is not None:
+            self.__global_timeout = datetime.now() + global_cooldown
+        self.__channel_timeouts[message.channel.id] = datetime.now() + channel_cooldown
+        await message.channel.send("", embed=discord.Embed(
+            title=self.__acronym,
+            description=self.__expansion
+        ))
+
+
+class GuildState(object):
+    def __init__(self, guild_id: int, data: object, owner):
+        self.__id = guild_id
+        self.__data = data
+        self.__owner = owner
+        self.migrate_data()
+
+    def migrate_data(self):
+        to_delete = []
+        for key in self.__data.keys():
+            if key != 'cfc' and key != 'acronyms':
+                to_delete.append(key)
+        for delete in to_delete:
+            del self.__data[delete]
+
+    def cfg(self, key, default):
+        if 'cfg' not in self.__data:
+            return default
+        if key not in self.__data['cfg']:
+            return default
+        return self.__data['cfg'][key]
+
+    def set_cfg(self, key: str, value):
+        self.__data.setdefault('cfg', {})[key] = value
+
+    def add_acronym(self, acronym: str, expansion: str):
+        self.__data.setdefault('acronyms', {})[acronym] = Acronym(acronym, expansion)
+
+    def remove_acronym(self, acronym: str) -> bool:
+        to_remove = []
+        for key in self.acronyms():
+            if key.__search == acronym.upper():
+                to_remove.append(key.acronym())
+        for remove in to_remove:
+            del self.__data['acronyms'][remove]
+        return len(to_remove) > 0
+
+    def acronyms(self) -> list[Acronym]:
+        return self.__data.setdefault('acronyms', {}).values()
+
+    def __del__(self):
+        self.__owner.save(self.__id)
+
+
+class State(object):
+    def __init__(self, state_path):
+        self.path = state_path
+        self.states = {}
+        try:
+            with open(state_path, 'rb') as state:
+                self.states = pickle.load(state)
+        except Exception as e:
+            print("Unable to load state: {}".format(e))
+
+    def get(self, guild_id):
+        return GuildState(guild_id, self.states.setdefault(guild_id, {}), self)
+
+    def save(self, guild_id):
+        if not self.states[guild_id]:
+            print("Culling empty guild: {}".format(guild_id))
+            del self.states[guild_id]
+
+        try:
+            with open(self.path, 'wb') as state_file:
+                pickle.dump(self.states, state_file)
+        except Exception as e:
+            print("Failed to save state: {}".format(e))
 
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path)
@@ -14,10 +118,8 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = discord.app_commands.CommandTree(client)
 
-states = state.State(state_path)
+states = State(state_path)
 
-N = 'acronyms'
-C = 'cooldown'
 DEFAULT_COOL_DOWN = timedelta(seconds=30)
 
 @client.event
@@ -31,21 +133,13 @@ async def on_message(message: discord.Message):
         return
     state = states.get(message.guild.id)
     if message.author != client.user:
-        for key in state.data.setdefault(N, {}).keys():
-            data = state.data[N][key]
-            if message.channel.id in data:
-                if data[message.channel.id] < datetime.now():
-                    del data[message.channel.id]
-            if message.channel.id not in data:
-                if key in message.content.upper():
-                    delta = DEFAULT_COOL_DOWN
-                    if C in state.data:
-                        delta = state.data[C]
-                    data[message.channel.id] = datetime.now() + delta
-                    await message.channel.send("", embed=discord.Embed(
-                        title=key,
-                        description=data['phrase']
-                    ))
+        for acronym in state.acronyms():
+            if acronym.should_expand(message.channel.id) and acronym.is_within(message.content):
+                await acronym.expand(
+                    message,
+                    state.cfg('global_cooldown', None),
+                    state.cfg('cooldown', DEFAULT_COOL_DOWN)
+                )
 
 @tree.command()
 async def add(ctx: discord.Interaction, acronym: str, phrase: str):
@@ -57,11 +151,8 @@ async def add(ctx: discord.Interaction, acronym: str, phrase: str):
         phrase (str): What the acronym means
     """
     state = states.get(ctx.guild.id)
-    state.data.setdefault(N, {})[acronym.upper()] = {
-        'phrase': phrase,
-        'cooldown': {}
-    }
-    await ctx.response.send_message(f"Added acronym {acronym.upper()}: {phrase}", ephemeral=True)
+    state.add_acronym(acronym, phrase)
+    await ctx.response.send_message(f"Added acronym {acronym}: {phrase}", ephemeral=True)
 
 @tree.command()
 async def remove(ctx: discord.Interaction, acronym: str):
@@ -72,16 +163,10 @@ async def remove(ctx: discord.Interaction, acronym: str):
         acronym (str): The acronym to delete (case insensitive)
     """
     state = states.get(ctx.guild.id)
-    to_remove = []
-    for key in state.data.setdefault(N, {}).keys():
-        if key.upper() == acronym.upper():
-            to_remove.append(key)
-    for remove in to_remove:
-        del state.data.setdefault(N, {})[remove]
-    if len(to_remove) == 0:
-        await ctx.response.send_message(f"Acronym '{acronym}' not found.", ephemeral=True)
-    else:
+    if state.remove_acronym(acronym):
         await ctx.response.send_message(f"Deleted '{acronym}'.", ephemeral=True)
+    else:
+        await ctx.response.send_message(f"Acronym '{acronym}' not found.", ephemeral=True)
 
 
 @tree.command()
@@ -93,8 +178,8 @@ async def list(ctx: discord.Interaction):
     """
     state = states.get(ctx.guild.id)
     resp = "**The following acronyms have been registered:**"
-    for key in state.data.setdefault(N, {}).keys():
-        resp += f"\n{key}: {state.data[N][key]['phrase']}"
+    for key in state.acronyms():
+        resp += f"\n{key.acronym()}: {key.expansion()}"
     await ctx.response.send_message(resp, ephemeral=True)
 
 @tree.command()
@@ -105,10 +190,7 @@ async def cooldown(ctx: discord.Interaction):
         ctx (discord.Interaction): The command context
     """
     state = states.get(ctx.guild.id)
-    if C in state.data:
-        await ctx.response.send_message(f"Cooldown is set to: {state.data[C]}")
-    else:
-        await ctx.response.send_message(f"Cooldown is set to {DEFAULT_COOL_DOWN}")
+    await ctx.response.send_message(f"Cooldown is set to: {state.cfg('cooldown', DEFAULT_COOL_DOWN)}", ephemeral=True)
 
 @tree.command()
 async def set_cooldown(ctx: discord.Interaction, cooldown_hours: float):
@@ -119,7 +201,29 @@ async def set_cooldown(ctx: discord.Interaction, cooldown_hours: float):
         cooldown (float): Number of hours to wait between expanding acronyms
     """
     state = states.get(ctx.guild.id)
-    state.data[C] = timedelta(hours=cooldown_hours)
-    await ctx.response.send_message(f"Cooldown set: {state.data[C]}", ephemeral=True)
+    state.set_cfg('cooldown', timedelta(hours=cooldown_hours))
+    await ctx.response.send_message(f"Cooldown is set to: {state.cfg('cooldown', DEFAULT_COOL_DOWN)}", ephemeral=True)
+
+@tree.command()
+async def global_cooldown(ctx: discord.Interaction):
+    """Displays the current global cooldown
+
+    Args:
+        ctx (discord.Interaction): The command context
+    """
+    state = states.get(ctx.guild.id)
+    await ctx.response.send_message(f"global cooldown is set to: {state.cfg('global_cooldown', None)}", ephemeral=True)
+
+@tree.command()
+async def set_global_cooldown(ctx: discord.Interaction, cooldown_hours: float):
+    """Sets the global cooldown for acronym reminders
+
+    Args:
+        ctx (discord.Interaction): The command context
+        global_cooldown (float): Number of hours to wait between expanding acronyms
+    """
+    state = states.get(ctx.guild.id)
+    state.set_cfg('global_cooldown', timedelta(hours=cooldown_hours))
+    await ctx.response.send_message(f"global cooldown is set to: {state.cfg('global_cooldown', None)}", ephemeral=True)
 
 client.run(os.getenv('BOT_TOKEN'))
