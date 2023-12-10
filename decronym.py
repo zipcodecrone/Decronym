@@ -6,9 +6,10 @@ import pickle
 
 
 class Acronym(object):
-    def __init__(self, acronym: str, expansion: str):
+    def __init__(self, acronym: str, expansion: str, url: str = None):
         self.__acronym = acronym
         self.__search = acronym.upper()
+        self.__url = url
         self.__expansion = expansion
         self.__channel_timeouts = {}
         self.__global_timeout = None
@@ -18,6 +19,15 @@ class Acronym(object):
 
     def expansion(self) -> str:
         return self.__expansion
+
+    def has_url(self) -> bool:
+        return self.__url is not None
+
+    def url(self) -> str:
+        return self.__url
+
+    def search(self) -> str:
+        return self.__search
 
     def should_expand(self, channel_id: int) -> bool:
         if channel_id in self.__channel_timeouts:
@@ -32,6 +42,9 @@ class Acronym(object):
 
     def is_within(self, message: str) -> bool:
         return self.__search in message.upper()
+
+    def matches(self, acronym: str) -> bool:
+        return self.__search == acronym.upper()
 
     async def expand(
         self,
@@ -76,16 +89,16 @@ class GuildState(object):
     def set_cfg(self, key: str, value):
         self.__data.setdefault(GuildState.CFG, {})[key] = value
 
-    def add_acronym(self, acronym: str, expansion: str):
-        self.__data.setdefault(GuildState.ACRONYMS, {})[acronym] = Acronym(
-            acronym, expansion
+    def add_acronym(self, acronym: str, expansion: str, url: str = None):
+        self.__data.setdefault(GuildState.ACRONYMS, {})[acronym.upper()] = Acronym(
+            acronym, expansion, url
         )
 
     def remove_acronym(self, acronym: str) -> bool:
         to_remove = []
-        for key in self.acronyms():
-            if key.__search == acronym.upper():
-                to_remove.append(key.acronym())
+        for key, acronym_obj in self.__data.setdefault(GuildState.ACRONYMS, {}).items():
+            if acronym_obj.matches(acronym):
+                to_remove.append(key)
         for remove in to_remove:
             del self.__data[GuildState.ACRONYMS][remove]
         return len(to_remove) > 0
@@ -161,16 +174,17 @@ async def on_message(message: discord.Message):
 
 
 @tree.command()
-async def add(ctx: discord.Interaction, acronym: str, phrase: str):
+async def add(ctx: discord.Interaction, acronym: str, phrase: str, url: str = None):
     """Adds a new acronym
 
     Args:
         ctx (discord.Interaction): Command context
         acronym (str): Acronym to store (will be stored in all uppercase)
         phrase (str): What the acronym means
+        url (str): URL with more information
     """
     state = states.get(ctx.guild.id)
-    state.add_acronym(acronym, phrase)
+    state.add_acronym(acronym, phrase, url)
     await ctx.response.send_message(
         f"Added acronym {acronym}: {phrase}", ephemeral=True
     )
